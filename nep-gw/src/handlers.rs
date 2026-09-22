@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
 };
 use chrono::Local;
-use nep_protocol::parse_payload;
+use nep_protocol::{parse_payload, parse_tphp_payload, InverterModel};
 use prometheus::{Encoder, TextEncoder};
 use std::sync::Arc;
 use tracing::{error, info, warn};
@@ -85,6 +85,63 @@ pub async fn handle_inverter_post(
             Err(StatusCode::BAD_REQUEST)
         }
     }
+}
+
+/// Handle the `/t.php` POST used by newer NEP firmware (e.g. BDM-1200-LV).
+///
+/// The real cloud endpoint accepts the inverter's *bare* request and sends NO
+/// HTTP response (it TCP-ACKs the body and the inverter closes after a few
+/// seconds), so we: (1) fire-and-forget a byte-exact minimal request upstream
+/// via `UpstreamForwarder::proxy` (a normal HTTP client's extra headers get the
+/// request RST'd), (2) parse the payload for MQTT/Home Assistant, and (3) return
+/// an immediate empty 200 to the inverter.
+pub async fn handle_tphp_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> StatusCode {
+    let hex_payload: String = body.iter().map(|b| format!("{:02x}", b)).collect();
+    info!(
+        "Received POST /t.php from microinverter. Size: {} bytes. Raw hex payload: {}",
+        body.len(),
+        hex_payload
+    );
+
+    if let Some(forwarder) = &state.upstream {
+        if headers.contains_key(RELAY_MARKER_HEADER) {
+            warn!(
+                "/t.php request carrying {} -- upstream resolves back to this gateway (DNS loop). Not forwarding.",
+                RELAY_MARKER_HEADER
+            );
+        } else {
+            let forwarder = forwarder.clone();
+            let body = body.clone();
+            tokio::spawn(async move {
+                forwarder.proxy("/t.php", body).await;
+            });
+        }
+    }
+
+    // /t.php is the BDM-1200-LV family's format regardless of the configured
+    // INVERTER_MODEL, so parse it with the BDM-1200-LV scales.
+    match parse_tphp_payload(&body, InverterModel::Bdm1200Lv) {
+        Ok(telemetry) => {
+            info!(
+                "Parsed /t.php telemetry from serial {:08x}: {:.0} W, {:.1} V, {:.2} Hz, {:.1} C",
+                telemetry.serial_number,
+                telemetry.ac_power_w,
+                telemetry.ac_voltage_v,
+                telemetry.ac_freq_hz,
+                telemetry.temp_c
+            );
+            if let Err(e) = state.tx.send(telemetry).await {
+                error!("Failed to forward /t.php telemetry to MQTT worker: {:?}", e);
+            }
+        }
+        Err(err) => warn!("Failed to parse /t.php payload: {}", err),
+    }
+
+    StatusCode::OK
 }
 
 pub async fn handle_metrics() -> String {

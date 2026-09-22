@@ -161,6 +161,7 @@ async fn main() {
     // Build the Axum router
     let app = Router::new()
         .route("/i.php", post(handlers::handle_inverter_post))
+        .route("/t.php", post(handlers::handle_tphp_post))
         .route("/metrics", get(handlers::handle_metrics))
         .with_state(app_state);
 

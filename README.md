@@ -17,6 +17,7 @@ It operates by spoofing the cloud endpoint `http://www.nepviewer.net/i.php`, par
 * **Auto-Discovery in Home Assistant**: Automatic sensor creation in Home Assistant via MQTT Discovery (voltage, power, daily energy, temperature, frequency, reactive power, status).
 * **Prometheus Metrics**: Scraping endpoint `/metrics` for custom Grafana dashboards.
 * **NOM Parser**: Fast, safe binary parsing of the 45-byte payload implemented in Rust.
+* **BDM-1200-LV Support (`/t.php`)**: Newer NEP firmware (WiFi fw 3.01.25+, e.g. the plug-in BDM-1200-LV) posts a **69-byte** payload to **`/t.php`** instead of the 45-byte `/i.php`. The gateway decodes AC power (÷25.6 W), AC grid voltage (÷51.2 V), frequency (÷256 Hz) and DSP temperature (÷100 °C), all validated against the NEP cloud and app on a live unit. Set `INVERTER_MODEL=BDM-1200-LV`. Per-input DC currents and the daily-energy word are not located yet (report 0 — derive energy in HA by integrating power).
 * **BDM-400 & BDM-800 Support**: Handles both the single-input BDM-400 and the dual-MPPT BDM-800, including independent per-channel DC current readings on the BDM-800 (verified against a live packet capture). Set `INVERTER_MODEL` / `--model` to your model — it selects the payload field scales, not just Home Assistant metadata: the BDM-800's AC-power and daily-energy words use different scaling, calibrated against a reference meter (with BDM-400 scales a BDM-800 under-reads power by ~27%). See `CLAUDE.md` for the calibration data.
 * **Optional Cloud Passthrough**: Dual-delivery mode (`--forward-upstream`) relays packets to the real NEP cloud so the official app keeps working alongside local monitoring.
 * **DC Voltage & Power Reconstruction**: Dynamically estimates DC PV voltage and panel power using standard inverter efficiency curves (since the inverter natively omits DC PV voltage from its uploads). ⚠️ The reconstruction assumes the BDM-400's panel topology — on the BDM-800 the AC-side values and per-channel DC currents are reliable, but treat reconstructed DC voltage/power/efficiency with skepticism.
@@ -25,7 +26,7 @@ It operates by spoofing the cloud endpoint `http://www.nepviewer.net/i.php`, par
 
 ## 📐 The Telemetry Protocol
 
-The microinverter uploads unencrypted HTTP `POST` requests to `/i.php` containing a fixed-length **45-byte** binary payload. The structure has been fully reverse-engineered:
+Older firmware uploads unencrypted HTTP `POST` requests to `/i.php` with a fixed-length **45-byte** binary payload (documented below). Newer firmware (e.g. BDM-1200-LV) posts a **69-byte** payload to **`/t.php`** — same `0x79`/`0x4014` framing and dual checksums, extended data section; see [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md) for its field map. The 45-byte structure:
 
 ### 45-Byte Packet Layout
 
@@ -73,7 +74,7 @@ The gateway is configured via the following environment variables:
 | `MQTT_USERNAME` | Username for MQTT broker authentication (omit for anonymous) | *(none)* |
 | `MQTT_PASSWORD` | Password for MQTT broker authentication (requires `MQTT_USERNAME`) | *(empty)* |
 | `RUST_LOG` | Tracing logging level (`info`, `debug`, `error`) | `info` |
-| `INVERTER_MODEL` | Inverter model: selects payload field scales (AC power, daily energy) and Home Assistant metadata (`BDM-400` or `BDM-800`); also `--model <name>` | `BDM-400` |
+| `INVERTER_MODEL` | Inverter model: selects payload field scales and Home Assistant metadata (`BDM-400`, `BDM-800`, or `BDM-1200-LV`); also `--model <name>`. `/t.php` traffic always uses BDM-1200-LV scales regardless of this setting. | `BDM-400` |
 | `FORWARD_UPSTREAM` | Set to `true` to also relay inverter POSTs to the real NEP cloud (dual-delivery mode) | `false` |
 | `UPSTREAM_URL` | Upstream endpoint used in dual-delivery mode (plain HTTP only) | `http://www.nepviewer.net/i.php` |
 
@@ -207,8 +208,11 @@ The gateway exposes a standard Prometheus `/metrics` endpoint on the configured 
 
 ## 📜 License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the **GNU GPLv3** - see the [LICENSE](LICENSE) file for details. (The badge and LICENSE file are GPLv3; earlier README text mistakenly said MIT.)
 
-## 🤝 Credits
+## 🤝 Credits & Lineage
+
+This is a fork chain: **[Nic0w/nep-local-gw](https://github.com/Nic0w/nep-local-gw)** (original local NEP gateway, GPLv3) → **[cronnelly/nep-local-gw](https://github.com/cronnelly/nep-local-gw)** (BDM-800 support, optional cloud passthrough, MQTT auth) → this fork (**BDM-1200-LV `/t.php`** support, byte-exact raw-TCP upstream forwarder for the picky cloud endpoint, native multi-arch Docker build).
+
 
 Special thanks to the community efforts, particularly **[BlinxFox/nep-gw](https://github.com/BlinxFox/nep-gw)**, for providing the initial hardware references and inspiration for local BDM-600/MMI-600 telemetry redirection.

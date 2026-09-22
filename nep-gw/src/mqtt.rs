@@ -135,6 +135,9 @@ async fn publish_ha_discovery(
     let ac_voltage_label = match model_kind {
         InverterModel::Bdm800 => "Internal Bus Voltage",
         InverterModel::Bdm400 => "AC Grid Voltage",
+        // On the BDM-1200-LV the /t.php voltage word IS real grid RMS
+        // (validated against the app on a 120 V leg, 2026-09-22).
+        InverterModel::Bdm1200Lv => "AC Grid Voltage",
     };
 
     let sensors = vec![

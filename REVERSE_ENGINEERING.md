@@ -147,3 +147,35 @@ During the initial research phase, we drew high-level conceptual inspiration fro
 While `BlinxFox/nep-gw` provided excellent conceptual validation, we developed the entire byte-level parsing logic, binary structures, dual-checksum verification, Q-format scaling conversions, thermodynamic temperature physics, and daily energy accumulator mathematical proofs **100% independently from scratch** using raw packet captures (`.pcap`) and thermodynamic/electrical physical reasoning.
 
 We highly credit `BlinxFox` for pioneering local integration for NEP-based hardware and providing a great conceptual reference for our Rust gateway architecture!
+
+---
+
+## 🆕 Addendum: The `/t.php` Payload (BDM-1200-LV, 2026-09)
+
+Newer NEP firmware (WiFi module fw **3.01.25**, 2025-04-03; observed on a **BDM-1200-LV** plug-in microinverter) changed the telemetry path and payload:
+
+### Endpoint & transport
+- The inverter POSTs to **`http://www.nepviewer.net/t.php`** (not `/i.php`), plain HTTP, `Host: www.nepviewer.net`, `Connection: close`.
+- **The cloud sends no HTTP response.** It TCP-ACKs the body and the inverter closes the connection after ~5 s. A gateway therefore does not need to (and cannot) relay a response — it just needs to deliver the bytes and give the inverter an immediate empty `200`.
+- **The endpoint is picky about the request.** It accepts the inverter's *bare* request (only `Host`, `Connection: close`, `Content-Length`) but **RSTs a normal HTTP client's request** — a client that adds `User-Agent`/`Accept`/`Accept-Encoding` gets the connection reset with the body never ACKed (confirmed by packet capture). `nep-gw` therefore forwards by writing a **byte-exact minimal request over a raw TCP socket** rather than via a normal HTTP client.
+- NEP has **migrated the cloud's IP** at least once (a previously-working address went dead). Pin the upstream by hostname and give the gateway a real resolver rather than a hard-coded IP.
+
+### 69-byte payload layout
+Same framing as `/i.php`: `[0]=0x79`, `[1..3]` u16 LE length (**62**), `[3..5]=0x4014`, `[5..13]` 8-byte gateway id (`0xFF` padding), `[13..15]` u16 LE data-section length (**52**), `[15..19]` `0xC3C3C3C3` sync, then the data section, then two trailing checksums (additive sum + XOR over bytes `1..67`, at `[67]`/`[68]` — identical scheme to `/i.php`).
+
+| Offset | Type | Scale | Field | Confidence |
+| :--- | :--- | :--- | :--- | :--- |
+| `19..23` | u32 LE | — | Serial number | validated |
+| `23..25` | u16 LE | — | Status code | — |
+| `25..27` | u16 LE | `/25.6` → W | **AC power** | high — tracked cloud `totalNow` 263→302 W |
+| `33..35` | u16 LE | `/256` → Hz | **Frequency** | high — ~60.0 Hz US grid |
+| `35..37` | u16 LE | `/100` → °C | **DSP temperature** | high — 36→41 °C under load |
+| `53..55` | u16 LE | `/51.2` → V | **AC grid voltage** | high — matched 122.5 V in app on a 120 V leg |
+| `37` | u8 | — | Upload counter (~+1/upload), **not** daily energy | — |
+| `55..57` | u16 LE | — | Duplicate of AC power (`25..27`) | — |
+| `57` | u8 | — | Duplicate of byte `37` | — |
+| `39..41` | — | — | Constant `05 eb` | — |
+
+Not yet located: per-input DC currents (the BDM-1200-LV has up to 3 inputs) and a clean daily-energy accumulator. Derive daily/monthly energy in Home Assistant by integrating AC power (`utility_meter` / Riemann `integral`), which also keeps it cloud-independent.
+
+Note the AC-power scale here is **`/25.6`**, distinct from the BDM-400's `/100` and the BDM-800's `/(25π)`; the voltage scale is **`/51.2`** vs `/25.6` on the older models. Unit tests in `nep-protocol/src/lib.rs` (`test_parse_tphp_*`) pin these against real captured packets.

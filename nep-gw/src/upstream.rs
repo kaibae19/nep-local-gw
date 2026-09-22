@@ -82,4 +82,70 @@ impl UpstreamForwarder {
             }
         }
     }
+
+    /// Deliver a raw inverter payload to the real cloud at `path`, byte-for-byte
+    /// like the inverter itself.
+    ///
+    /// The NEP `/t.php` endpoint is picky: it accepts the inverter's *bare*
+    /// request (Host + Connection: close + Content-Length, nothing else) but
+    /// REJECTS a normal HTTP client's request -- with reqwest's default headers
+    /// the server RSTs without ever acking the body (confirmed by packet
+    /// capture). So we write the exact minimal request over a raw TCP socket.
+    /// The endpoint sends no HTTP response, so we deliver and return whatever
+    /// (usually nothing) comes back. Loop-safe because the container resolves
+    /// `UPSTREAM_HOST` via a public resolver, never back to this gateway.
+    pub async fn proxy(&self, path: &str, body: Bytes) -> Option<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpStream;
+
+        let addr = format!("{}:80", UPSTREAM_HOST);
+        let mut stream = match tokio::time::timeout(
+            Duration::from_secs(5),
+            TcpStream::connect(&addr),
+        )
+        .await
+        {
+            Ok(Ok(s)) => s,
+            Ok(Err(e)) => {
+                UPSTREAM_FORWARD_ERRORS.inc();
+                warn!("Failed to connect to upstream {}: {}", addr, e);
+                return None;
+            }
+            Err(_) => {
+                UPSTREAM_FORWARD_ERRORS.inc();
+                warn!("Timed out connecting to upstream {}", addr);
+                return None;
+            }
+        };
+
+        let head = format!(
+            "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n",
+            path,
+            UPSTREAM_HOST,
+            body.len()
+        );
+        if let Err(e) = stream.write_all(head.as_bytes()).await {
+            UPSTREAM_FORWARD_ERRORS.inc();
+            warn!("Failed to send request head to {}: {}", addr, e);
+            return None;
+        }
+        if let Err(e) = stream.write_all(&body).await {
+            UPSTREAM_FORWARD_ERRORS.inc();
+            warn!("Failed to send body to {}: {}", addr, e);
+            return None;
+        }
+        let _ = stream.flush().await;
+        UPSTREAM_FORWARDS.inc();
+
+        let mut buf = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(3), stream.read_to_end(&mut buf)).await;
+        info!(
+            "Delivered {} bytes to {}{} ({} resp bytes)",
+            body.len(),
+            UPSTREAM_HOST,
+            path,
+            buf.len()
+        );
+        Some(buf)
+    }
 }
