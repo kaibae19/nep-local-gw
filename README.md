@@ -4,9 +4,9 @@
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![Docker](https://img.shields.io/badge/docker-alpine-blue.svg)](Dockerfile)
 
-A local, privacy-focused gateway (`nep-gw`) and protocol parser (`nep-protocol`) designed to intercept and parse telemetry payloads sent by rebranded **NEP BDM-400** and **NEP BDM-800** microinverters. 
+A local, privacy-focused gateway (`nep-gw`) and protocol parser (`nep-protocol`) designed to intercept and parse telemetry payloads sent by NEP microinverters — the **BDM-400** and **BDM-800** (45-byte `/i.php` payload) and the 3-input plug-in **BDM-1200-LV** (69-byte `/t.php` payload on 2025+ firmware).
 
-It operates by spoofing the cloud endpoint `http://www.nepviewer.net/i.php`, parsing the unencrypted binary telemetry packets locally, and forwarding the decoded measurements directly to **Home Assistant (via MQTT)** and **Prometheus**.
+It operates by spoofing the cloud endpoint (`http://www.nepviewer.net/i.php` or `/t.php`), parsing the unencrypted binary telemetry packets locally, and forwarding the decoded measurements directly to **Home Assistant (via MQTT)** and **Prometheus** — while optionally relaying the raw packets on to the real NEP cloud so the official app keeps working.
 
 ---
 
@@ -51,6 +51,36 @@ Older firmware uploads unencrypted HTTP `POST` requests to `/i.php` with a fixed
 | `41–42` | 2 | `int16` (LE) | `/ 100.0` (VAR) | AC Reactive Power in signed Volt-Amperes Reactive |
 | `43` | 1 | `uint8` | sum % 256 | **Additive Checksum** (bytes 1 to 42) |
 | `44` | 1 | `uint8` | XOR reduction | **XOR Checksum** (bytes 1 to 42) |
+
+### 69-Byte `/t.php` Packet Layout (BDM-1200-LV, 2025+ firmware)
+
+Same `0x79` / `0x4014` framing and dual-checksum scheme, with an extended 52-byte data
+section. Field map validated on a live 3-input unit against the NEP cloud and app (2026-09);
+see [REVERSE_ENGINEERING.md](REVERSE_ENGINEERING.md) for the derivation.
+
+| Offset (dec) | Type | Scale | Metric |
+| :--- | :--- | :--- | :--- |
+| `0` | `uint8` | `0x79` | Framing start |
+| `1–2` | `uint16` (LE) | `62` | Payload length (offset 5..66) |
+| `3–4` | `uint16` (BE) | `0x4014` | Command id |
+| `5–12` | 8 bytes | `0xFF` pad | Gateway/AP id |
+| `13–14` | `uint16` (LE) | `52` | Data-section length |
+| `15–18` | 4 bytes | `0xC3C3C3C3` | Sync header |
+| `19–22` | `uint32` (LE) | — | Inverter serial number |
+| `23–24` | `uint16` (LE) | — | Status code |
+| `25–26` | `uint16` (LE) | `/ 25.6` (W) | **Total AC power** |
+| `33–34` | `uint16` (LE) | `/ 256.0` (Hz) | Grid frequency |
+| `35–36` | `uint16` (LE) | `/ 100.0` (°C) | DSP temperature |
+| `43–44` | `uint16` (LE) | `/ 25.6` (W) | **PV input 1 power** (addr 1) |
+| `49–50` | `uint16` (LE) | `/ 25.6` (W) | **PV input 2 power** (addr 2) |
+| `53–54` | `uint16` (LE) | `/ 51.2` | ⚠️ Internal voltage — **NOT grid RMS**; tracks an internal/DC quantity that changes with the active PV input |
+| `55–56` | `uint16` (LE) | `/ 25.6` (W) | **PV input 3 power** (addr 3) |
+| `67–68` | `2 × uint8` | sum, XOR | Checksums (bytes 1..66) |
+
+The three per-input powers (`43`/`49`/`55`) sum exactly to the total (`25`). Byte `37` is an
+upload counter (not daily energy); bytes `55–56` were long thought to duplicate power but are
+input 3. Per-input DC currents and a clean daily-energy word are **not located yet** — derive
+energy in Home Assistant by integrating power (see below).
 
 ---
 
@@ -106,6 +136,14 @@ is always sent), or leave it — relayed requests carry an `X-NEP-GW-Relay`
 marker and the gateway refuses to re-forward them, so a DNS loop degrades into
 a logged warning rather than an infinite relay loop.
 
+**`/t.php` note:** the newer endpoint is picky — it accepts the inverter's *bare* HTTP request
+but resets a normal HTTP client's (with extra headers), and it sends **no HTTP response** (it
+just TCP-ACKs the upload and the inverter closes). So for `/t.php`, `nep-gw` forwards by writing
+a byte-exact minimal request over a raw TCP socket and does not wait for a reply, answering the
+inverter itself with an immediate empty `200`. Give the container a public resolver (see Docker
+notes) so it reaches the real cloud; NEP has changed the cloud's IP before, so resolving by
+hostname (not a pinned IP) is more robust.
+
 ---
 
 ## ⚙️ Running as a systemd Service
@@ -136,7 +174,18 @@ After rebuilding, re-run the `install` step and `sudo systemctl restart nep-gw`.
 
 ## 🐳 Docker Deployment
 
-The gateway is packaged in an optimized Alpine-based multi-stage Dockerfile that supports compilation for multi-arch targets (including `aarch64` ARM targets like Raspberry Pi).
+The gateway is packaged in an optimized Alpine-based multi-stage Dockerfile that builds for the **host's native architecture** (x86_64 or aarch64 — e.g. a Raspberry Pi).
+
+> **Networking:** the inverter connects to `www.nepviewer.net` on **port 80**, so `nep-gw`
+> must own port 80 on an address the inverter can reach. If that host already runs something on
+> :80 (a reverse proxy such as Traefik/Nginx), **give the container its own LAN IP** via a
+> Docker `macvlan` network rather than a port map — a reverse proxy that force-redirects
+> HTTP→HTTPS will break the plain-HTTP inverter. Then point your LAN DNS (Pi-hole, dnsmasq,
+> pfSense, …) at that IP for `www.nepviewer.net`.
+>
+> **Container DNS (for dual-delivery):** because your LAN DNS now resolves `www.nepviewer.net`
+> to the gateway, give the *container* an honest public resolver (`dns: [1.1.1.1, 8.8.8.8]` in
+> compose) so its upstream relay reaches the *real* cloud instead of looping back to itself.
 
 ### Build Image
 ```bash
@@ -179,18 +228,35 @@ cargo test
 ## 🔌 Integrations
 
 ### Home Assistant MQTT Discovery
-On receiving telemetry from a new microinverter serial number, the gateway automatically publishes MQTT Discovery configuration topics to `homeassistant/sensor/nep_<serial_number>/...`.
-Sensors exposed:
-* `AC Power` (W)
-* `AC Voltage` (V)
-* `Grid Frequency` (Hz)
-* `DC Current` (A)
-* `DC Voltage` (V, reconstructed)
-* `DC Power` (W, reconstructed)
-* `Temperature` (°C)
-* `Daily Energy` (Wh)
-* `Reactive Power` (VAR)
-* `Inverter Status` (operating state)
+On receiving telemetry from a new microinverter serial number, the gateway automatically publishes MQTT Discovery configuration topics to `homeassistant/sensor/nep_<serial_number>/...`. The sensor set is model-specific:
+
+**BDM-400 / BDM-800 (`/i.php`):** AC Power (W), AC/Internal Voltage (V), Grid Frequency (Hz),
+DC Current total + per-channel (A), DC Voltage (V, reconstructed), DC Power (W, reconstructed),
+Temperature (°C), Daily Energy (Wh), Reactive Power (VAR), Error State, Operating Mode.
+
+**BDM-1200-LV (`/t.php`):** AC Power (W), **PV Input 1/2/3 Power** (W), Grid Frequency (Hz),
+Temperature (°C), Internal Voltage (V, diagnostic — not grid RMS), Error State. The DC-side,
+daily-energy, and reactive-power sensors are omitted because those fields aren't located in the
+`/t.php` payload yet.
+
+> **Tip:** create a *dedicated* Home Assistant user for MQTT (Settings → People → **Users** tab,
+> with Advanced Mode on — a user without a person) rather than reusing an account; the Mosquitto
+> add-on authenticates against HA users. Note that HA freezes an MQTT entity's `entity_id` in its
+> registry at first creation — renaming the discovery config later won't move it; rename via
+> **Settings → Entities** if you want a different id.
+
+### Home Assistant energy sensors (deriving kWh)
+
+The BDM-1200-LV `/t.php` payload has no clean daily-energy word, so build energy from power in
+HA (this also keeps it cloud-independent):
+
+1. **Settings → Devices & Services → Helpers → Create Helper → Integration - Riemann sum** on
+   `sensor.nep_<serial>_ac_power`, method *Trapezoidal*, metric prefix *k* (→ kWh). This gives a
+   cumulative-energy sensor.
+2. Add that sensor as **Solar production** in the **Energy dashboard** (it buckets daily/monthly
+   itself from the cumulative total).
+3. *(Optional)* Add a **Utility Meter** helper (daily cycle) on the Riemann sensor for a
+   "today's kWh" value that resets at midnight.
 
 ### Prometheus Scraping
 The gateway exposes a standard Prometheus `/metrics` endpoint on the configured HTTP port. Metrics exported:
