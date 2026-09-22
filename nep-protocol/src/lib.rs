@@ -17,6 +17,11 @@ pub enum InverterModel {
     #[default]
     Bdm400,
     Bdm800,
+    /// BDM-1200-LV and other newer firmware (WiFi fw 3.01.25+): posts a
+    /// 69-byte payload to `/t.php` instead of the 45-byte `/i.php`. AC power
+    /// scales /25.6 and AC voltage /51.2, validated against the NEP cloud's
+    /// own reported power and the app's voltage on a 120 V leg (2026-09-22).
+    Bdm1200Lv,
 }
 
 impl InverterModel {
@@ -31,6 +36,7 @@ impl InverterModel {
         match n.as_str() {
             "BDM400" => Some(Self::Bdm400),
             "BDM800" => Some(Self::Bdm800),
+            "BDM1200LV" | "BDM1200" => Some(Self::Bdm1200Lv),
             _ => None,
         }
     }
@@ -47,6 +53,9 @@ impl InverterModel {
         match self {
             Self::Bdm400 => raw as f64 / 100.0,
             Self::Bdm800 => raw as f64 / (25.0 * std::f64::consts::PI),
+            // Validated against the NEP cloud's own totalNow (263->302 W) on a
+            // live BDM-1200-LV, 2026-09-22.
+            Self::Bdm1200Lv => raw as f64 / 25.6,
         }
     }
 
@@ -59,6 +68,19 @@ impl InverterModel {
         match self {
             Self::Bdm400 => raw as f64 / 5.0,
             Self::Bdm800 => raw as f64 * 0.2308,
+            // The BDM-1200-LV /t.php daily-energy word has not been located
+            // yet (byte 37 is an upload counter, not energy). Unused.
+            Self::Bdm1200Lv => raw as f64 / 5.0,
+        }
+    }
+
+    /// Scales the raw AC-voltage word to Volts. The /i.php models use /25.6;
+    /// the BDM-1200-LV /t.php voltage word (byte 53) uses /51.2 -- validated
+    /// against 122.5 V shown in the app on a 120 V split-phase leg.
+    fn scale_voltage_v(self, raw: u16) -> f64 {
+        match self {
+            Self::Bdm1200Lv => raw as f64 / 51.2,
+            _ => raw as f64 / 25.6,
         }
     }
 }
@@ -261,9 +283,118 @@ pub fn parse_payload(input: &[u8], model: InverterModel) -> Result<NepTelemetry,
     Ok(telemetry)
 }
 
+/// Parse the 69-byte `/t.php` payload emitted by newer NEP firmware (e.g. the
+/// BDM-1200-LV on WiFi fw 3.01.25+). Same `0x79`/`0x4014` framing and dual
+/// checksums as the 45-byte `/i.php` payload, but with an extended 52-byte data
+/// section. Only fields validated against the NEP cloud and app are decoded;
+/// the per-input DC currents and the daily-energy word have not been located
+/// yet and are reported as 0 (derive energy in Home Assistant by integrating
+/// AC power).
+///
+/// Field map (offsets into the 69-byte frame), validated 2026-09:
+/// * `19..23` u32 LE  serial number
+/// * `23..25` u16 LE  status code
+/// * `25..27` u16 LE  AC power   (`scale_power_w`  -> /25.6 W on BDM-1200-LV)
+/// * `33..35` u16 LE  frequency  (/256 Hz)
+/// * `35..37` u16 LE  DSP temperature (/100 C)
+/// * `53..55` u16 LE  AC voltage (`scale_voltage_v` -> /51.2 V)
+///
+/// Byte 37 is an upload counter (not daily energy); bytes 55-56 duplicate the
+/// power word and byte 57 duplicates byte 37.
+pub fn parse_tphp_payload(input: &[u8], model: InverterModel) -> Result<NepTelemetry, String> {
+    if input.len() < 69 {
+        return Err(format!(
+            "Payload too short: expected 69 bytes, got {}",
+            input.len()
+        ));
+    }
+    let data = &input[..69];
+    if data[0] != 0x79 {
+        return Err(format!("Bad start byte: 0x{:02x}", data[0]));
+    }
+    // Dual checksums over bytes 1..67 (additive sum + XOR), stored at 67/68 --
+    // the same scheme as /i.php, just at the extended frame's offsets.
+    let body = &data[1..67];
+    let sum: u8 = body.iter().fold(0u8, |acc, &b| acc.wrapping_add(b));
+    let xor: u8 = body.iter().fold(0u8, |acc, &b| acc ^ b);
+    if data[67] != sum || data[68] != xor {
+        return Err("Checksum validation failed".to_string());
+    }
+
+    let u16le = |o: usize| (data[o] as u16) | ((data[o + 1] as u16) << 8);
+    let round2 = |v: f64| (v * 100.0).round() / 100.0;
+    let serial_number = (data[19] as u32)
+        | ((data[20] as u32) << 8)
+        | ((data[21] as u32) << 16)
+        | ((data[22] as u32) << 24);
+
+    Ok(NepTelemetry {
+        model,
+        serial_number,
+        status_code: u16le(23),
+        ac_power_w: round2(model.scale_power_w(u16le(25))),
+        ac_voltage_v: round2(model.scale_voltage_v(u16le(53))),
+        operating_flags: u16le(29),
+        dc_current_a: 0.0,
+        dc_current_ch1_a: 0.0,
+        dc_current_ch2_a: 0.0,
+        ac_freq_hz: round2(u16le(33) as f64 / 256.0),
+        dc_voltage_v: 0.0,
+        temp_c: round2(u16le(35) as f64 / 100.0),
+        daily_energy_wh: 0.0,
+        version: String::new(),
+        version_raw: u16le(39),
+        reactive_power_var: 0.0,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_tphp_bdm1200lv() {
+        // Live BDM-1200-LV /t.php packet, serial 0x86513AE0.
+        let hex = "793e004014ffffffffffffffff3400c3c3c3c3e03a51860000431a3f00700800010e3c600e120005eb3f00000000007f00000000002018431a120000000000000061d5256b";
+        let bytes = hex::decode(hex).unwrap();
+        let t = parse_tphp_payload(&bytes, InverterModel::Bdm1200Lv).unwrap();
+        assert_eq!(t.serial_number, 0x86513ae0);
+        assert_eq!(t.ac_power_w, 262.62); // 6723 / 25.6
+        assert_eq!(t.ac_voltage_v, 120.63); // 6176 / 51.2 (round half away from zero)
+        assert_eq!(t.ac_freq_hz, 60.05); // 15374 / 256
+        assert_eq!(t.temp_c, 36.8); // 3680 / 100
+    }
+
+    #[test]
+    fn test_parse_tphp_second_sample() {
+        let hex = "793e004014ffffffffffffffff3400c3c3c3c3e03a51860000f41c4f0060080001fc3b510f370005eb4f0000000000800000000000dc17f41c3700000000000000b9dbde64";
+        let bytes = hex::decode(hex).unwrap();
+        let t = parse_tphp_payload(&bytes, InverterModel::Bdm1200Lv).unwrap();
+        assert_eq!(t.serial_number, 0x86513ae0);
+        assert_eq!(t.ac_power_w, 289.53); // 7412 / 25.6
+        assert_eq!(t.ac_voltage_v, 119.3); // 6108 / 51.2
+        assert_eq!(t.ac_freq_hz, 59.98); // 15356 / 256
+        assert_eq!(t.temp_c, 39.21); // 3921 / 100
+    }
+
+    #[test]
+    fn test_parse_tphp_rejects_bad_checksum() {
+        let mut bytes = hex::decode("793e004014ffffffffffffffff3400c3c3c3c3e03a51860000431a3f00700800010e3c600e120005eb3f00000000007f00000000002018431a120000000000000061d5256b").unwrap();
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xff; // corrupt XOR checksum
+        assert!(parse_tphp_payload(&bytes, InverterModel::Bdm1200Lv).is_err());
+    }
+
+    #[test]
+    fn test_parse_tphp_rejects_short() {
+        assert!(parse_tphp_payload(&[0x79; 45], InverterModel::Bdm1200Lv).is_err());
+    }
+
+    #[test]
+    fn test_inverter_model_from_name_bdm1200lv() {
+        assert_eq!(InverterModel::from_name("BDM-1200-LV"), Some(InverterModel::Bdm1200Lv));
+        assert_eq!(InverterModel::from_name("bdm1200"), Some(InverterModel::Bdm1200Lv));
+    }
 
     #[test]
     fn test_parse_payload1() {
