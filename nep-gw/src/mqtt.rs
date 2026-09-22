@@ -88,6 +88,9 @@ pub async fn run_mqtt_worker(config: MqttConfig, mut rx: mpsc::Receiver<NepTelem
             "temperature_c": (telemetry.temp_c * 100.0).round() / 100.0,
             "daily_energy_wh": (telemetry.daily_energy_wh * 100.0).round() / 100.0,
             "reactive_power_var": (telemetry.reactive_power_var * 100.0).round() / 100.0,
+            "pv1_power_w": (telemetry.pv_input_power_w[0] * 100.0).round() / 100.0,
+            "pv2_power_w": (telemetry.pv_input_power_w[1] * 100.0).round() / 100.0,
+            "pv3_power_w": (telemetry.pv_input_power_w[2] * 100.0).round() / 100.0,
             "status": if telemetry.status_code == 0 { "OK" } else { "Error" },
             "error_state": telemetry.error_state_str(),
             "operating_mode": telemetry.operating_mode_str(),
@@ -140,7 +143,7 @@ async fn publish_ha_discovery(
         InverterModel::Bdm1200Lv => "AC Grid Voltage",
     };
 
-    let sensors = vec![
+    let mut sensors = vec![
         ("ac_power", "AC Output Power", "power", "W", "ac_power_w"),
         (
             "ac_voltage",
@@ -222,6 +225,19 @@ async fn publish_ha_discovery(
             "operating_mode",
         ),
     ];
+
+    // BDM-1200-LV (/t.php): only AC power, voltage, frequency, temperature and
+    // error state are decoded, plus per-input AC power (offsets 43/49/55 summing
+    // to the total). Drop the DC-side / daily-energy / reactive / operating-mode
+    // placeholders that aren't located for this payload, and add PV 1/2/3.
+    if model_kind == InverterModel::Bdm1200Lv {
+        sensors.retain(|(id, ..)| {
+            matches!(*id, "ac_power" | "ac_voltage" | "ac_freq" | "temperature" | "error_state")
+        });
+        sensors.push(("pv1_power", "PV Input 1 Power", "power", "W", "pv1_power_w"));
+        sensors.push(("pv2_power", "PV Input 2 Power", "power", "W", "pv2_power_w"));
+        sensors.push(("pv3_power", "PV Input 3 Power", "power", "W", "pv3_power_w"));
+    }
 
     for (id, name, dev_class, unit, json_key) in sensors {
         let mut config = json!({

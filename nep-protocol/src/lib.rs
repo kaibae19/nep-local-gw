@@ -113,6 +113,11 @@ pub struct NepTelemetry {
     pub version: String,
     pub version_raw: u16,
     pub reactive_power_var: f64,
+    /// Per-PV-input AC power in Watts (index 0 = input/addr 1 .. 2 = input/addr 3).
+    /// Only populated for the BDM-1200-LV `/t.php` payload (offsets 43/49/55,
+    /// 6-byte stride, each u16 LE /25.6); they sum to `ac_power_w`. Zeroed on
+    /// the /i.php models. Validated 59/59 payloads on a live 3-input unit.
+    pub pv_input_power_w: [f64; 3],
 }
 
 impl NepTelemetry {
@@ -260,6 +265,7 @@ fn parse_data_section(input: &[u8], model: InverterModel) -> IResult<&[u8], NepT
             version,
             version_raw,
             reactive_power_var,
+            pv_input_power_w: [0.0, 0.0, 0.0],
         },
     ))
 }
@@ -345,6 +351,11 @@ pub fn parse_tphp_payload(input: &[u8], model: InverterModel) -> Result<NepTelem
         version: String::new(),
         version_raw: u16le(39),
         reactive_power_var: 0.0,
+        pv_input_power_w: [
+            round2(model.scale_power_w(u16le(43))),
+            round2(model.scale_power_w(u16le(49))),
+            round2(model.scale_power_w(u16le(55))),
+        ],
     })
 }
 
@@ -363,6 +374,11 @@ mod tests {
         assert_eq!(t.ac_voltage_v, 120.63); // 6176 / 51.2 (round half away from zero)
         assert_eq!(t.ac_freq_hz, 60.05); // 15374 / 256
         assert_eq!(t.temp_c, 36.8); // 3680 / 100
+        // Single input active (PV3/addr3 @55); inputs 1 and 2 idle. The three
+        // per-input powers sum to the total AC power.
+        assert_eq!(t.pv_input_power_w, [0.0, 0.0, 262.62]);
+        let sum: f64 = t.pv_input_power_w.iter().sum();
+        assert!((sum - t.ac_power_w).abs() < 0.05, "per-input sum {sum} vs total {}", t.ac_power_w);
     }
 
     #[test]
