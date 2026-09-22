@@ -170,7 +170,10 @@ Same framing as `/i.php`: `[0]=0x79`, `[1..3]` u16 LE length (**62**), `[3..5]=0
 | `25..27` | u16 LE | `/25.6` → W | **AC power** | high — tracked cloud `totalNow` 263→302 W |
 | `33..35` | u16 LE | `/256` → Hz | **Frequency** | high — ~60.0 Hz US grid |
 | `35..37` | u16 LE | `/100` → °C | **DSP temperature** | high — 36→41 °C under load |
-| `53..55` | u16 LE | `/51.2` → V | **AC grid voltage** | high — matched 122.5 V in app on a 120 V leg |
+| `43..45` | u16 LE | `/25.6` → W | **PV input 1 power** (addr 1) | high — see below |
+| `49..51` | u16 LE | `/25.6` → W | **PV input 2 power** (addr 2) | high — 0 when empty |
+| `55..57` | u16 LE | `/25.6` → W | **PV input 3 power** (addr 3) | high — see below |
+| `53..55` | u16 LE | `/51.2` | internal voltage (**NOT grid RMS**) | low — input-dependent, see note |
 | `37` | u8 | — | Upload counter (~+1/upload), **not** daily energy | — |
 | `55..57` | u16 LE | — | Duplicate of AC power (`25..27`) | — |
 | `57` | u8 | — | Duplicate of byte `37` | — |
@@ -179,3 +182,10 @@ Same framing as `/i.php`: `[0]=0x79`, `[1..3]` u16 LE length (**62**), `[3..5]=0
 Not yet located: per-input DC currents (the BDM-1200-LV has up to 3 inputs) and a clean daily-energy accumulator. Derive daily/monthly energy in Home Assistant by integrating AC power (`utility_meter` / Riemann `integral`), which also keeps it cloud-independent.
 
 Note the AC-power scale here is **`/25.6`**, distinct from the BDM-400's `/100` and the BDM-800's `/(25π)`; the voltage scale is **`/51.2`** vs `/25.6` on the older models. Unit tests in `nep-protocol/src/lib.rs` (`test_parse_tphp_*`) pin these against real captured packets.
+
+
+### Per-input AC power (3 PV inputs) and the byte-53 voltage caveat
+
+The BDM-1200-LV has **three PV inputs**. Their AC power is three u16 LE words at **offsets 43, 49, 55** (6-byte stride), each `/25.6` W, that **sum exactly to the total AC power** (`@25`) — verified 59/59 payloads across a live single→dual-input transition, and cross-checked against the cloud's per-module map (`addr 1/2/3` ↔ offsets 43/49/55; an empty input reads 0). Powering one input off drops its word to 0 while the total re-balances, confirming the mapping.
+
+**Byte 53 is NOT grid voltage.** It was briefly thought to be (a single `/51.2` = 122.5 V matched the app), but powering the DC panels in different combinations showed it tracks an internal/DC quantity that changes with the *active input* — ~120 with a 425 W panel, ~60 with a 2×300 W series string — i.e. inverse to string voltage, and unaffected by the (unchanged) AC grid. It is exposed only as a diagnostic pending a proper decode with per-input controlled captures.

@@ -138,9 +138,11 @@ async fn publish_ha_discovery(
     let ac_voltage_label = match model_kind {
         InverterModel::Bdm800 => "Internal Bus Voltage",
         InverterModel::Bdm400 => "AC Grid Voltage",
-        // On the BDM-1200-LV the /t.php voltage word IS real grid RMS
-        // (validated against the app on a 120 V leg, 2026-09-22).
-        InverterModel::Bdm1200Lv => "AC Grid Voltage",
+        // On the BDM-1200-LV the /t.php byte-53 word is NOT grid RMS: it
+        // tracks an internal/DC quantity that changes with which PV input is
+        // producing (~120 with the 425 W panel, ~60 with the 2x300 W string),
+        // so it is exposed as a diagnostic "Internal Voltage" pending decode.
+        InverterModel::Bdm1200Lv => "Internal Voltage",
     };
 
     let mut sensors = vec![

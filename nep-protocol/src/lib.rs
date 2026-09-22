@@ -76,7 +76,10 @@ impl InverterModel {
 
     /// Scales the raw AC-voltage word to Volts. The /i.php models use /25.6;
     /// the BDM-1200-LV /t.php voltage word (byte 53) uses /51.2 -- validated
-    /// against 122.5 V shown in the app on a 120 V split-phase leg.
+    /// NOTE: on the BDM-1200-LV /t.php this byte-53 word is NOT grid RMS. A
+    /// single 122.5 V match was coincidental; it tracks an internal/DC value
+    /// that changes with the active PV input (inverse to string voltage), so
+    /// treat it as a diagnostic pending further decode.
     fn scale_voltage_v(self, raw: u16) -> f64 {
         match self {
             Self::Bdm1200Lv => raw as f64 / 51.2,
@@ -303,7 +306,7 @@ pub fn parse_payload(input: &[u8], model: InverterModel) -> Result<NepTelemetry,
 /// * `25..27` u16 LE  AC power   (`scale_power_w`  -> /25.6 W on BDM-1200-LV)
 /// * `33..35` u16 LE  frequency  (/256 Hz)
 /// * `35..37` u16 LE  DSP temperature (/100 C)
-/// * `53..55` u16 LE  AC voltage (`scale_voltage_v` -> /51.2 V)
+/// * `53..55` u16 LE  internal voltage (/51.2) -- NOT grid RMS; input-dependent
 ///
 /// Byte 37 is an upload counter (not daily energy); bytes 55-56 duplicate the
 /// power word and byte 57 duplicates byte 37.
