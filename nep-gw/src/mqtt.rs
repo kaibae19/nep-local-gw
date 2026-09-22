@@ -243,7 +243,7 @@ async fn publish_ha_discovery(
 
     for (id, name, dev_class, unit, json_key) in sensors {
         let mut config = json!({
-            "name": format!("NEP {} {}", serial, name),
+            "name": name,
             "state_topic": state_topic,
             "value_template": format!("{{{{ value_json.{} }}}}", json_key),
             "unique_id": format!("nep_{}_{}", serial, id),
