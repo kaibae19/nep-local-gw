@@ -239,6 +239,10 @@ Temperature (°C), Internal Voltage (V, diagnostic — not grid RMS), Error Stat
 daily-energy, and reactive-power sensors are omitted because those fields aren't located in the
 `/t.php` payload yet.
 
+Every sensor sets `expire_after` (300 s on the BDM-1200-LV, which reports every ~60 s; 3000 s on
+the BDM-400/800, which report about every 10 min). When the inverter sleeps at night the sensors
+go **unavailable** in HA instead of holding the last temperature/frequency until morning.
+
 > **Tip:** create a *dedicated* Home Assistant user for MQTT (Settings → People → **Users** tab,
 > with Advanced Mode on — a user without a person) rather than reusing an account; the Mosquitto
 > add-on authenticates against HA users. Note that HA freezes an MQTT entity's `entity_id` in its

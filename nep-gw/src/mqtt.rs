@@ -113,6 +113,18 @@ pub async fn run_mqtt_worker(config: MqttConfig, mut rx: mpsc::Receiver<NepTelem
     }
 }
 
+/// Seconds without telemetry before Home Assistant marks the sensors
+/// unavailable (MQTT discovery `expire_after`). Without it HA holds the last
+/// value forever, so temperature/frequency flat-line through the night after
+/// the inverter sleeps. Roughly five missed reports: the BDM-1200-LV posts
+/// every ~60 s, the BDM-400/800 about every 10 min.
+fn expire_after_secs(model_kind: InverterModel) -> u64 {
+    match model_kind {
+        InverterModel::Bdm1200Lv => 300,
+        InverterModel::Bdm400 | InverterModel::Bdm800 => 3000,
+    }
+}
+
 async fn publish_ha_discovery(
     client: &AsyncClient,
     serial: &str,
@@ -247,7 +259,8 @@ async fn publish_ha_discovery(
             "state_topic": state_topic,
             "value_template": format!("{{{{ value_json.{} }}}}", json_key),
             "unique_id": format!("nep_{}_{}", serial, id),
-            "device": device
+            "device": device,
+            "expire_after": expire_after_secs(model_kind)
         });
 
         if !dev_class.is_empty() {
@@ -287,4 +300,17 @@ async fn publish_ha_discovery(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expire_after_spans_several_missed_reports() {
+        // BDM-1200-LV reports every ~60 s; BDM-400/800 about every 10 min.
+        assert!(expire_after_secs(InverterModel::Bdm1200Lv) >= 4 * 60);
+        assert!(expire_after_secs(InverterModel::Bdm800) >= 4 * 600);
+        assert!(expire_after_secs(InverterModel::Bdm400) >= 4 * 600);
+    }
 }
