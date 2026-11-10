@@ -227,7 +227,7 @@ async fn publish_ha_discovery(
             "reactive_power",
             "Reactive Power",
             "reactive_power",
-            "VAR",
+            "var",
             "reactive_power_var",
         ),
         ("error_state", "Error State", "enum", "", "error_state"),
